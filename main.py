@@ -2,6 +2,9 @@
 """
 微信公众号文章读取工具
 绕过 robots.txt 限制，直接获取并解析微信文章 HTML，转为 Markdown 输出。
+支持两种图片加载方式：
+1. HTML内嵌 <img> 标签（老版文章）
+2. JS变量 cdn_url_N_N 动态加载（新版文章）
 """
 
 import sys
@@ -39,16 +42,13 @@ def fetch_wechat_article(url: str) -> dict:
     
     # 提取标题
     title = ""
-    # 尝试从 var msg_title 提取
     title_match = re.search(r'var\s+msg_title\s*=\s*["\'](.+?)["\']', content)
     if title_match:
         title = html.unescape(title_match.group(1))
-    # 备选：从 og:title 提取
     if not title:
         title_match = re.search(r'property="og:title"\s+content="([^"]+)"', content)
         if title_match:
             title = html.unescape(title_match.group(1))
-    # 备选：从 activity-name 提取
     if not title:
         title_match = re.search(r'id="activity-name"[^>]*>(.*?)</h\d>', content, re.DOTALL)
         if title_match:
@@ -60,26 +60,43 @@ def fetch_wechat_article(url: str) -> dict:
     if author_match:
         author = html.unescape(author_match.group(1))
     if not author:
-        author_match = re.search(r'id="profileBt"[^>]*>.*?<a[^>]*>(.*?)</a>', content, re.DOTALL)
-        if author_match:
-            author = html.unescape(author_match.group(1).strip())
-    if not author:
         author_match = re.search(r'class="profile_nickname"[^>]*>(.*?)</strong>', content, re.DOTALL)
         if author_match:
             author = html.unescape(author_match.group(1).strip())
     
-    # 提取正文内容
-    article_html = ""
-    # 从 js_content div 提取
-    content_match = re.search(r'id="js_content"[^>]*>(.*?)</div>\s*(?:<script|<div\s+class="rich_media_tool)', content, re.DOTALL)
-    if content_match:
-        article_html = content_match.group(1)
+    # ===== 提取图片URL（两种来源） =====
+    images = []
     
-    if not article_html:
-        # 备选：尝试从 rich_media_content 提取
-        content_match = re.search(r'class="rich_media_content"[^>]*>(.*?)</div>\s*(?:<script|<div\s+class="rich_media_tool)', content, re.DOTALL)
-        if content_match:
-            article_html = content_match.group(1)
+    # 来源1：从JS变量提取（新版文章，图片不在HTML中）
+    # cdn_url_N_N 格式，N是序号，用于正文图片
+    seen_urls = set()
+    for match in re.finditer(r'cdn_url_(\d+)_(\d+)\s*=\s*["\x27]*(https?://mmbiz[^"\x27\s,;)]+)', content):
+        url_str = match.group(3)
+        if url_str not in seen_urls:
+            seen_urls.add(url_str)
+            images.append({"url": url_str, "index": int(match.group(1))})
+    
+    # 来源2：从HTML img标签提取（老版文章，图片直接在HTML中）
+    article_html = _extract_article_html(content)
+    if article_html:
+        for match in re.finditer(r'<img[^>]+>', article_html):
+            img_tag = match.group(0)
+            # 优先 data-src（微信懒加载），其次 src
+            src_match = re.search(r'data-src="([^"]+)"', img_tag)
+            if not src_match:
+                src_match = re.search(r'src="([^"]+)"', img_tag)
+            if src_match:
+                img_url = src_match.group(1)
+                if img_url not in seen_urls and 'mmbiz' in img_url:
+                    seen_urls.add(img_url)
+                    images.append({"url": img_url, "index": 0})
+    
+    # 封面图
+    cover = re.search(r'msg_cdn_url\s*=\s*["\x27]*(https?://mmbiz[^"\x27\s,;)]+)', content)
+    cover_url = cover.group(1) if cover else None
+    
+    # 按index排序（正文图片按微信编号排列）
+    images.sort(key=lambda x: x["index"])
     
     if not article_html:
         # 检查是否是"关注后查看"类型
@@ -90,11 +107,43 @@ def fetch_wechat_article(url: str) -> dict:
     # HTML 转 Markdown
     markdown = html_to_markdown(article_html)
     
-    return {
+    # 在正文末尾附加图片（新版文章图片不在HTML中，需要额外列出）
+    if images:
+        # 检查正文Markdown中是否已包含图片引用
+        existing_imgs = len(re.findall(r'!\[图片\]', markdown))
+        js_only_imgs = [img for img in images if img["index"] > 0]
+        
+        if js_only_imgs and existing_imgs == 0:
+            # 正文里没有图片引用但JS里有→新版文章，图片需单独附加
+            markdown += "\n\n---\n**文章图片：**\n\n"
+            for i, img in enumerate(js_only_imgs, 1):
+                markdown += f"![图片{i}]({img['url']})\n\n"
+    
+    result = {
         "title": title or "未知标题",
         "author": author or "未知公众号",
         "content": markdown
     }
+    
+    if cover_url:
+        result["cover"] = cover_url
+    
+    return result
+
+
+def _extract_article_html(content: str) -> str:
+    """从页面HTML中提取正文区域"""
+    # 从 js_content div 提取
+    content_match = re.search(r'id="js_content"[^>]*>(.*?)</div>\s*(?:<script|<div\s+class="rich_media_tool)', content, re.DOTALL)
+    if content_match:
+        return content_match.group(1)
+    
+    # 备选：尝试从 rich_media_content 提取
+    content_match = re.search(r'class="rich_media_content"[^>]*>(.*?)</div>\s*(?:<script|<div\s+class="rich_media_tool)', content, re.DOTALL)
+    if content_match:
+        return content_match.group(1)
+    
+    return ""
 
 
 def html_to_markdown(html_str: str) -> str:
@@ -103,7 +152,6 @@ def html_to_markdown(html_str: str) -> str:
     # 处理图片：提取 data-src 或 src
     def replace_img(match):
         img_tag = match.group(0)
-        # 优先取 data-src（微信懒加载）
         src_match = re.search(r'data-src="([^"]+)"', img_tag)
         if not src_match:
             src_match = re.search(r'src="([^"]+)"', img_tag)
@@ -173,6 +221,8 @@ def main():
     # 输出格式化的 Markdown
     print(f"# {result['title']}")
     print(f"作者：{result['author']}")
+    if result.get("cover"):
+        print(f"封面：![封面]({result['cover']})")
     print()
     print(result['content'])
 
