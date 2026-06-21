@@ -1,0 +1,1 @@
+# 无额外依赖，使用 Python 标准库 + coze_workload_identity
